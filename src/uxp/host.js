@@ -154,7 +154,7 @@ async function handle(rawMsg) {
             layerID: layer.id,
             componentSize: 8,
             colorSpace: "RGB",
-            applyAlpha: false,
+            applyAlpha: true,
             sourceBounds: sourceBounds,
           };
 

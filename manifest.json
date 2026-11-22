@@ -41,6 +41,13 @@
   ],
   "requiredPermissions": {
     "localFileSystem": "plugin",
+    "network": {
+      "domains": [
+        "https://huggingface.co",
+        "https://cdn-lfs.huggingface.co",
+        "https://cdn-lfs-us-1.huggingface.co"
+      ]
+    },
     "webview": {
       "allow": "yes",
       "allowLocalRendering": "yes",

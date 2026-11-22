@@ -7,8 +7,8 @@ import {
 import {
   ScanlineRenderer,
   type ViewportMode,
-  type OffscreenTarget,
 } from "./engine/scanlineRenderer";
+import { estimateDepth, type DepthStatus } from "./engine/depthPipeline";
 import { sendToUxp, onUxpMessage } from "./bridge";
 
 // ─── Precision Slider Row Component ──────────────────────────────────────────
@@ -48,7 +48,7 @@ const SliderRow: React.FC<SliderRowProps> = ({
   };
 
   return (
-    <div className="slider-container" style={{ margin: "4px 0" }}>
+    <div className="slider-container" style={{ margin: "3px 0" }}>
       <div className="slider-header">
         <span
           className="slider-label"
@@ -132,7 +132,6 @@ function createFallbackImage(w = 400, h = 400): Uint8Array {
       const dist = Math.sqrt(dx * dx + dy * dy) / maxR;
       const angle = Math.atan2(dy, dx);
 
-      // Topographic harmonic ripples
       const ripple = Math.sin(dist * 18.0 - angle * 2.0) * 0.5 + 0.5;
       const vignette = Math.max(0, 1.0 - dist * 0.85);
       const intensity = Math.round((ripple * 0.6 + vignette * 0.4) * 255);
@@ -176,12 +175,20 @@ export const App: React.FC = () => {
     docHeight?: number;
   } | null>(null);
 
+  // Depth Estimation State
+  const [depthStatus, setDepthStatus] = useState<DepthStatus>("idle");
+  const [depthProgressText, setDepthProgressText] = useState("");
+  const [hasDepth, setHasDepth] = useState(false);
+  const cachedDepthBufferRef = useRef<Uint8Array | null>(null);
+
   const [status, setStatus] = useState<"ready" | "busy" | "error">("ready");
   const [statusText, setStatusText] = useState("Ready");
   const [isApplying, setIsApplying] = useState(false);
 
-  // Collapsible Sections
-  const [collapsed, setCollapsed] = useState<{ lines: boolean; light: boolean; colour: boolean }>({
+  // Collapsible Sections: 0 (input), depth sub-panel, 1 (lines), 2 (light), 3 (colour)
+  const [collapsed, setCollapsed] = useState({
+    input: false,
+    depth: false,
     lines: false,
     light: false,
     colour: false,
@@ -195,7 +202,15 @@ export const App: React.FC = () => {
   paramsRef.current = params;
 
   const updateParam = useCallback(<K extends keyof ScanlineParams>(key: K, val: ScanlineParams[K]) => {
-    setParams((prev) => ({ ...prev, [key]: val }));
+    setParams((prev) => {
+      const next = { ...prev, [key]: val };
+      if (key === "colorMode") {
+        next.pictureColours = val === "picture";
+      } else if (key === "pictureColours") {
+        next.colorMode = val ? "picture" : "solid";
+      }
+      return next;
+    });
   }, []);
 
   // ── 1. WebGL Initialization & Live Render ──────────────────────────────────
@@ -206,7 +221,6 @@ export const App: React.FC = () => {
       renderer.init();
       rendererRef.current = renderer;
 
-      // Initialize with procedural fallback test image
       const fallbackW = 400;
       const fallbackH = 400;
       const fallbackPixels = createFallbackImage(fallbackW, fallbackH);
@@ -236,7 +250,6 @@ export const App: React.FC = () => {
     const unsubscribe = onUxpMessage((msg) => {
       if (msg.type === "LAYER_PIXELS") {
         if (msg.purpose === "COMMIT") {
-          // Offscreen full-resolution commit pipeline
           handleFullResCommit(msg.buffer, msg.width, msg.height);
           return;
         }
@@ -272,13 +285,59 @@ export const App: React.FC = () => {
       }
     });
 
-    // Request active layer preview on mount
     sendToUxp({ type: "REQUEST_ACTIVE_LAYER", maxPreviewDim: 800, purpose: "PREVIEW" });
 
     return () => unsubscribe();
   }, [viewMode, splitX]);
 
-  // ── 3. Apply to Layer (Offscreen Full-Res Pipeline) ─────────────────────────
+  // ── 3. Depth Anything V2 Generation ────────────────────────────────────────
+  const handleGenerateDepth = async () => {
+    const sourcePixels = activeLayer?.pixels || (canvasRef.current ? createFallbackImage(400, 400) : null);
+    const w = activeLayer?.width || 400;
+    const h = activeLayer?.height || 400;
+
+    if (!sourcePixels || !rendererRef.current) return;
+
+    setDepthStatus("loading");
+    setDepthProgressText("Initializing WebGPU Depth...");
+
+    try {
+      const result = await estimateDepth(sourcePixels, w, h, (_pct, msg) => {
+        setDepthProgressText(msg);
+      });
+
+      cachedDepthBufferRef.current = result.depthBuffer;
+      rendererRef.current.uploadDepthTexture(result.depthBuffer, w, h);
+      setHasDepth(true);
+      setDepthStatus("ready");
+      setDepthProgressText("3D Depth Ready");
+
+      // Auto-boost relief source to 1.0 so depth is visible immediately
+      setParams((prev) => ({
+        ...prev,
+        reliefSource: prev.reliefSource === 0 ? 0.8 : prev.reliefSource,
+      }));
+
+      rendererRef.current.render(paramsRef.current, viewMode, splitX);
+    } catch (err) {
+      console.error("[ScanlineX] Depth generation failed:", err);
+      setDepthStatus("error");
+      setDepthProgressText("Depth Estimation Failed");
+    }
+  };
+
+  const handleClearDepth = () => {
+    if (rendererRef.current) {
+      rendererRef.current.clearDepthTexture();
+    }
+    cachedDepthBufferRef.current = null;
+    setHasDepth(false);
+    setDepthStatus("idle");
+    setDepthProgressText("");
+    setParams((prev) => ({ ...prev, reliefSource: 0.0, depthCutoff: 0.0 }));
+  };
+
+  // ── 4. Apply to Layer (Full-Res Offscreen Commit) ───────────────────────────
   const handleFullResCommit = (rawPixels: Uint8Array, docW: number, docH: number) => {
     if (!rendererRef.current) return;
     setStatus("busy");
@@ -287,8 +346,25 @@ export const App: React.FC = () => {
     try {
       const p = paramsRef.current;
 
+      // If depth map was used in preview, scale depth map to full resolution for the offscreen run
+      if (hasDepth && cachedDepthBufferRef.current && activeLayer) {
+        const previewW = activeLayer.width;
+        const previewH = activeLayer.height;
+        const fullDepth = new Uint8Array(docW * docH);
+        const prevDepth = cachedDepthBufferRef.current;
+
+        // Bilinear/nearest scale of depth map to document resolution
+        for (let y = 0; y < docH; y++) {
+          const sy = Math.min(previewH - 1, Math.floor((y / docH) * previewH));
+          for (let x = 0; x < docW; x++) {
+            const sx = Math.min(previewW - 1, Math.floor((x / docW) * previewW));
+            fullDepth[y * docW + x] = prevDepth[sy * previewW + sx];
+          }
+        }
+        rendererRef.current.uploadDepthTexture(fullDepth, docW, docH);
+      }
+
       if (p.keepAs === "lines-glow") {
-        // Two-layer commit: 1. Glow (Screen/LinearDodge), 2. Lines (Normal)
         const glowBuffer = rendererRef.current.renderOffscreen(rawPixels, docW, docH, p, "glow");
         sendToUxp({
           type: "COMMIT_LAYER",
@@ -311,7 +387,6 @@ export const App: React.FC = () => {
           buffer: linesBuffer,
         });
       } else {
-        // Single unified composite layer
         const compositeBuffer = rendererRef.current.renderOffscreen(rawPixels, docW, docH, p, "composite");
         sendToUxp({
           type: "COMMIT_LAYER",
@@ -337,24 +412,21 @@ export const App: React.FC = () => {
     setStatusText("Reading full document...");
 
     if (window.uxpHost) {
-      // Request full-resolution document layer from Photoshop UXP
       sendToUxp({ type: "REQUEST_ACTIVE_LAYER", purpose: "COMMIT" });
     } else {
-      // Standalone browser preview mode
       setTimeout(() => {
         if (!rendererRef.current) return;
         const fallbackW = activeLayer?.width || 800;
         const fallbackH = activeLayer?.height || 800;
         const fallbackPixels = activeLayer?.pixels || createFallbackImage(fallbackW, fallbackH);
 
-        const result = rendererRef.current.renderOffscreen(
+        rendererRef.current.renderOffscreen(
           fallbackPixels,
           fallbackW,
           fallbackH,
           paramsRef.current,
           "composite"
         );
-        console.log("[ScanlineX] Standalone offscreen render completed. Pixels:", result.length);
         setIsApplying(false);
         setStatus("ready");
         setStatusText("Rendered Standalone");
@@ -369,9 +441,9 @@ export const App: React.FC = () => {
     sendToUxp({ type: "REQUEST_ACTIVE_LAYER", maxPreviewDim: 800, purpose: "PREVIEW" });
   };
 
-  // ── 4. Preset Management ────────────────────────────────────────────────────
+  // ── 5. Presets ──────────────────────────────────────────────────────────────
   const handleSelectPreset = (name: string) => {
-    let presetData = PRESETS[name] || customPresets[name];
+    const presetData = PRESETS[name] || customPresets[name];
     if (presetData) {
       setParams((prev) => ({
         ...prev,
@@ -405,7 +477,7 @@ export const App: React.FC = () => {
     });
   };
 
-  // ── 5. Split Wipe Mouse Scrubbing ───────────────────────────────────────────
+  // ── 6. Split Wipe Scrubbing ─────────────────────────────────────────────────
   const handleWipeMouseDown = (e: React.MouseEvent) => {
     if (viewMode !== "split") return;
     setIsDraggingWipe(true);
@@ -432,13 +504,19 @@ export const App: React.FC = () => {
     };
   }, [isDraggingWipe]);
 
-  // Color Swatch quick optical chips
   const colorChips = [
     { name: "Mono", hex: "#e8e8e8" },
     { name: "Ice", hex: "#7dd3fc" },
     { name: "Phosphor", hex: "#39ff14" },
     { name: "Amber", hex: "#fbbf24" },
     { name: "Neon", hex: "#00ff88" },
+  ];
+
+  const gradientDuotones = [
+    { name: "Optical Ice", shadow: "#0c1427", peak: "#7dd3fc" },
+    { name: "Phosphor Peak", shadow: "#052e16", peak: "#4ade80" },
+    { name: "Sunset Amber", shadow: "#3b0764", peak: "#fbbf24" },
+    { name: "Cyberpunk", shadow: "#1e1b4b", peak: "#f43f5e" },
   ];
 
   return (
@@ -468,7 +546,6 @@ export const App: React.FC = () => {
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-          {/* 22x22 Optical Mark */}
           <div
             style={{
               width: "22px",
@@ -492,7 +569,6 @@ export const App: React.FC = () => {
             ScanlineX
           </span>
 
-          {/* 6x6 Status Indicator Square */}
           <div
             title={statusText}
             style={{
@@ -510,7 +586,6 @@ export const App: React.FC = () => {
           />
         </div>
 
-        {/* Preset Selector & Actions */}
         <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
           <select
             className="uxp-select"
@@ -578,7 +653,6 @@ export const App: React.FC = () => {
             justifyContent: "center",
           }}
         >
-          {/* Canvas */}
           <canvas
             ref={canvasRef}
             style={{
@@ -589,7 +663,7 @@ export const App: React.FC = () => {
             }}
           />
 
-          {/* Top-Left View Mode Segmented Control */}
+          {/* Top-Left View Mode Toggle */}
           <div
             style={{
               position: "absolute",
@@ -691,6 +765,192 @@ export const App: React.FC = () => {
           backgroundColor: "var(--bg-surface)",
         }}
       >
+        {/* SECTION 0: INPUT & ISOLATION */}
+        <section
+          style={{
+            borderBottom: "1px solid var(--border-grid)",
+            position: "relative",
+          }}
+        >
+          <div className="swiss-crosshair" style={{ left: "2px", top: "-4px" }} />
+
+          <div
+            style={{
+              padding: "10px 12px 6px",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              cursor: "pointer",
+            }}
+            onClick={() => setCollapsed((p) => ({ ...p, input: !p.input }))}
+          >
+            <span
+              style={{
+                fontSize: "10.5px",
+                fontWeight: 600,
+                letterSpacing: "0.08em",
+                color: "var(--text-muted)",
+              }}
+            >
+              0. INPUT & ISOLATION
+            </span>
+            <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+              {collapsed.input ? "▼" : "▲"}
+            </span>
+          </div>
+
+          {!collapsed.input && (
+            <div style={{ padding: "0 12px 12px" }}>
+              {/* Auto-Normalize Toggle */}
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  marginBottom: "8px",
+                }}
+              >
+                <label className="uxp-checkbox-label">
+                  <input
+                    type="checkbox"
+                    className="uxp-checkbox"
+                    checked={params.autoNormalize}
+                    onChange={(e) => updateParam("autoNormalize", e.target.checked)}
+                  />
+                  <span>Auto-Normalize Histogram</span>
+                </label>
+              </div>
+
+              <SliderRow
+                label="Input Black"
+                value={params.inputBlack}
+                min={0.0}
+                max={0.9}
+                step={0.01}
+                defaultValue={DEFAULT_PARAMS.inputBlack}
+                onChange={(v) => updateParam("inputBlack", v)}
+              />
+
+              <SliderRow
+                label="Input White"
+                value={params.inputWhite}
+                min={0.1}
+                max={1.0}
+                step={0.01}
+                defaultValue={DEFAULT_PARAMS.inputWhite}
+                onChange={(v) => updateParam("inputWhite", v)}
+              />
+
+              <SliderRow
+                label="Gamma"
+                value={params.gamma}
+                min={0.2}
+                max={3.0}
+                step={0.01}
+                defaultValue={DEFAULT_PARAMS.gamma}
+                onChange={(v) => updateParam("gamma", v)}
+              />
+
+              {/* Collapsible Depth Anything V2 Sub-Panel */}
+              <div
+                style={{
+                  marginTop: "10px",
+                  padding: "8px",
+                  borderRadius: "var(--radius-control)",
+                  border: "1px solid var(--border-grid)",
+                  backgroundColor: "var(--bg-canvas)",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    cursor: "pointer",
+                    marginBottom: collapsed.depth ? "0" : "8px",
+                  }}
+                  onClick={() => setCollapsed((p) => ({ ...p, depth: !p.depth }))}
+                >
+                  <span
+                    style={{
+                      fontSize: "10px",
+                      fontWeight: 600,
+                      letterSpacing: "0.06em",
+                      color: hasDepth ? "var(--accent-glow)" : "var(--text-secondary)",
+                    }}
+                  >
+                    DEPTH ISOLATION {hasDepth && "• ACTIVE"}
+                  </span>
+                  <span style={{ fontSize: "10px", color: "var(--text-muted)" }}>
+                    {collapsed.depth ? "▼" : "▲"}
+                  </span>
+                </div>
+
+                {!collapsed.depth && (
+                  <div>
+                    <div style={{ display: "flex", gap: "6px", marginBottom: "8px" }}>
+                      <button
+                        className="uxp-btn uxp-btn-sm"
+                        style={{ flex: 1 }}
+                        disabled={depthStatus === "loading" || depthStatus === "inferring"}
+                        onClick={handleGenerateDepth}
+                      >
+                        {depthStatus === "loading" || depthStatus === "inferring"
+                          ? "Generating..."
+                          : hasDepth
+                          ? "Regenerate Depth"
+                          : "Generate Depth Map"}
+                      </button>
+
+                      {hasDepth && (
+                        <button
+                          className="uxp-btn uxp-btn-sm"
+                          onClick={handleClearDepth}
+                          title="Clear Depth Map"
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+
+                    {depthProgressText && (
+                      <div
+                        style={{
+                          fontSize: "10px",
+                          color: depthStatus === "error" ? "var(--status-err)" : "var(--text-secondary)",
+                          marginBottom: "8px",
+                        }}
+                      >
+                        {depthProgressText}
+                      </div>
+                    )}
+
+                    <SliderRow
+                      label="Depth Cutoff (Z-Plane)"
+                      value={params.depthCutoff}
+                      min={0.0}
+                      max={1.0}
+                      step={0.01}
+                      defaultValue={DEFAULT_PARAMS.depthCutoff}
+                      onChange={(v) => updateParam("depthCutoff", v)}
+                    />
+
+                    <SliderRow
+                      label="Relief Source (Luma <-> Depth)"
+                      value={params.reliefSource}
+                      min={0.0}
+                      max={1.0}
+                      step={0.01}
+                      defaultValue={DEFAULT_PARAMS.reliefSource}
+                      onChange={(v) => updateParam("reliefSource", v)}
+                    />
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </section>
+
         {/* SECTION 1: LINES */}
         <section
           style={{
@@ -698,7 +958,6 @@ export const App: React.FC = () => {
             position: "relative",
           }}
         >
-          {/* Structural Swiss Crosshair */}
           <div className="swiss-crosshair" style={{ left: "2px", top: "-4px" }} />
 
           <div
@@ -728,7 +987,6 @@ export const App: React.FC = () => {
 
           {!collapsed.lines && (
             <div style={{ padding: "0 12px 12px" }}>
-              {/* Direction & Invert Micro-Row */}
               <div
                 style={{
                   display: "flex",
@@ -782,6 +1040,58 @@ export const App: React.FC = () => {
               />
 
               <SliderRow
+                label="Line Thickness"
+                value={params.lineThickness}
+                min={0.5}
+                max={4.0}
+                step={0.1}
+                defaultValue={DEFAULT_PARAMS.lineThickness}
+                unit="px"
+                onChange={(v) => updateParam("lineThickness", v)}
+              />
+
+              <SliderRow
+                label="Edge Accent (Sobel Boost)"
+                value={params.edgeAccent}
+                min={0.0}
+                max={1.0}
+                step={0.01}
+                defaultValue={DEFAULT_PARAMS.edgeAccent}
+                onChange={(v) => updateParam("edgeAccent", v)}
+              />
+
+              {/* 3D Tilt Perspective Micro-Row (2-Columns) */}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr 1fr",
+                  gap: "10px",
+                  margin: "4px 0",
+                }}
+              >
+                <SliderRow
+                  label="Tilt Pitch"
+                  value={params.tiltPitch}
+                  min={-45}
+                  max={45}
+                  step={1}
+                  defaultValue={DEFAULT_PARAMS.tiltPitch}
+                  unit="°"
+                  onChange={(v) => updateParam("tiltPitch", v)}
+                />
+                <SliderRow
+                  label="Tilt Yaw"
+                  value={params.tiltYaw}
+                  min={-45}
+                  max={45}
+                  step={1}
+                  defaultValue={DEFAULT_PARAMS.tiltYaw}
+                  unit="°"
+                  onChange={(v) => updateParam("tiltYaw", v)}
+                />
+              </div>
+
+              <SliderRow
                 label="Pixel"
                 value={params.pixel}
                 min={0}
@@ -800,7 +1110,6 @@ export const App: React.FC = () => {
                 onChange={(v) => updateParam("cutoff", v)}
               />
 
-              {/* Noise with New Seed Button */}
               <div style={{ display: "flex", alignItems: "flex-end", gap: "8px" }}>
                 <div style={{ flex: 1 }}>
                   <SliderRow
@@ -833,7 +1142,6 @@ export const App: React.FC = () => {
             position: "relative",
           }}
         >
-          {/* Structural Swiss Crosshair */}
           <div className="swiss-crosshair" style={{ left: "2px", top: "-4px" }} />
 
           <div
@@ -874,7 +1182,7 @@ export const App: React.FC = () => {
               />
 
               <SliderRow
-                label="Soft"
+                label="Soft Spread"
                 value={params.soft}
                 min={0}
                 max={1}
@@ -884,7 +1192,7 @@ export const App: React.FC = () => {
               />
 
               <SliderRow
-                label="Dispersion"
+                label="Chromatic Dispersion"
                 value={params.dispersion}
                 min={0}
                 max={1}
@@ -913,7 +1221,6 @@ export const App: React.FC = () => {
             position: "relative",
           }}
         >
-          {/* Structural Swiss Crosshair */}
           <div className="swiss-crosshair" style={{ left: "2px", top: "-4px" }} />
 
           <div
@@ -943,26 +1250,53 @@ export const App: React.FC = () => {
 
           {!collapsed.colour && (
             <div style={{ padding: "0 12px 12px" }}>
-              {/* Picture Colours vs Tint Swatch */}
+              {/* 3-Mode Selector */}
               <div
                 style={{
                   display: "flex",
                   justifyContent: "space-between",
                   alignItems: "center",
-                  margin: "8px 0",
+                  margin: "6px 0 10px",
                 }}
               >
-                <label className="uxp-checkbox-label">
-                  <input
-                    type="checkbox"
-                    className="uxp-checkbox"
-                    checked={params.pictureColours}
-                    onChange={(e) => updateParam("pictureColours", e.target.checked)}
-                  />
-                  <span>Picture Colours</span>
-                </label>
+                <span style={{ fontSize: "11.5px", color: "var(--text-secondary)" }}>
+                  Color Mode
+                </span>
+                <div className="uxp-segmented">
+                  <button
+                    className={`uxp-segmented-btn ${params.colorMode === "solid" ? "active" : ""}`}
+                    onClick={() => updateParam("colorMode", "solid")}
+                  >
+                    Solid Tint
+                  </button>
+                  <button
+                    className={`uxp-segmented-btn ${params.colorMode === "gradient" ? "active" : ""}`}
+                    onClick={() => updateParam("colorMode", "gradient")}
+                  >
+                    Gradient Ramp
+                  </button>
+                  <button
+                    className={`uxp-segmented-btn ${params.colorMode === "picture" ? "active" : ""}`}
+                    onClick={() => updateParam("colorMode", "picture")}
+                  >
+                    Picture Colours
+                  </button>
+                </div>
+              </div>
 
-                {!params.pictureColours && (
+              {/* Mode A: Solid Tint */}
+              {params.colorMode === "solid" && (
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    marginBottom: "10px",
+                  }}
+                >
+                  <span style={{ fontSize: "11.5px", color: "var(--text-secondary)" }}>
+                    Tint Color
+                  </span>
                   <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
                     {colorChips.map((chip) => (
                       <div
@@ -974,7 +1308,6 @@ export const App: React.FC = () => {
                       />
                     ))}
 
-                    {/* Custom Color Input Swatch */}
                     <div
                       className="uxp-swatch"
                       style={{ backgroundColor: params.colour }}
@@ -995,8 +1328,90 @@ export const App: React.FC = () => {
                       />
                     </div>
                   </div>
-                )}
-              </div>
+                </div>
+              )}
+
+              {/* Mode B: Gradient Ramp */}
+              {params.colorMode === "gradient" && (
+                <div style={{ marginBottom: "12px" }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      marginBottom: "8px",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                      <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>Shadow:</span>
+                      <div
+                        className="uxp-swatch"
+                        style={{ backgroundColor: params.shadowColor }}
+                        title="Shadow Color (Low Relief)"
+                      >
+                        <input
+                          type="color"
+                          value={params.shadowColor}
+                          onChange={(e) => updateParam("shadowColor", e.target.value)}
+                          style={{
+                            opacity: 0,
+                            position: "absolute",
+                            inset: 0,
+                            width: "100%",
+                            height: "100%",
+                            cursor: "pointer",
+                          }}
+                        />
+                      </div>
+                    </div>
+
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                      <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>Peak:</span>
+                      <div
+                        className="uxp-swatch"
+                        style={{ backgroundColor: params.peakColor }}
+                        title="Peak Color (High Relief)"
+                      >
+                        <input
+                          type="color"
+                          value={params.peakColor}
+                          onChange={(e) => updateParam("peakColor", e.target.value)}
+                          style={{
+                            opacity: 0,
+                            position: "absolute",
+                            inset: 0,
+                            width: "100%",
+                            height: "100%",
+                            cursor: "pointer",
+                          }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Gradient Quick Duotone Chips */}
+                  <div style={{ display: "flex", gap: "6px" }}>
+                    {gradientDuotones.map((duo) => (
+                      <div
+                        key={duo.name}
+                        onClick={() => {
+                          updateParam("shadowColor", duo.shadow);
+                          updateParam("peakColor", duo.peak);
+                        }}
+                        style={{
+                          flex: 1,
+                          height: "20px",
+                          borderRadius: "3px",
+                          border: "1px solid var(--border-control)",
+                          background: `linear-gradient(to right, ${duo.shadow}, ${duo.peak})`,
+                          cursor: "pointer",
+                        }}
+                        title={duo.name}
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Background Swatch vs Transparent */}
               <div
