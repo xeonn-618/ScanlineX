@@ -519,11 +519,8 @@ void main() {
       fragColor = vec4(0.95, 0.95, 0.96, 1.0);
       return;
     } else if (v_uv.x < u_splitX) {
-      if (u_transparent == 1) {
-        fragColor = vec4(srcSample.rgb * srcSample.a, srcSample.a);
-      } else {
-        fragColor = vec4(mix(u_bgColor, srcSample.rgb, srcSample.a), 1.0);
-      }
+      vec3 beforeRgb = mix(vec3(0.031, 0.031, 0.039), srcSample.rgb, srcSample.a);
+      fragColor = vec4(beforeRgb, 1.0);
       return;
     }
   }

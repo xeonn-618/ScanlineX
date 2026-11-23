@@ -169,33 +169,17 @@ async function handle(rawMsg) {
             layerID: layer.id,
             componentSize: 8,
             colorSpace: "RGB",
-            applyAlpha: true,
+            applyAlpha: false,
             sourceBounds: { left: 0, top: 0, right: docW, bottom: docH },
           };
 
           const pixelObj = await imaging.getPixels(opts);
           const rawData = await pixelObj.imageData.getData();
-          let channels = pixelObj.imageData.components;
+          const channels = pixelObj.imageData.components;
           const blockW = pixelObj.imageData.width;
           const blockH = pixelObj.imageData.height;
 
-          // Normalize to 4 channels RGBA
-          let blockData = rawData;
-          if (channels === 3) {
-            const pixelCount = blockW * blockH;
-            const rgba = new Uint8Array(pixelCount * 4);
-            for (let i = 0, j = 0; i < pixelCount; i++, j += 3) {
-              const dest = i * 4;
-              rgba[dest]     = rawData[j];
-              rgba[dest + 1] = rawData[j + 1];
-              rgba[dest + 2] = rawData[j + 2];
-              rgba[dest + 3] = 255;
-            }
-            blockData = rgba;
-            channels = 4;
-          }
-
-          // Extract bounding box offset inside document
+          // Extract bounding box offset inside document before disposing native object
           const sb = pixelObj.sourceBounds || pixelObj.imageData.sourceBounds || layer.bounds;
           let left = 0;
           let top = 0;
@@ -207,16 +191,81 @@ async function handle(rawMsg) {
           // Allocate full-document buffer initialized to all zeros (0, 0, 0, 0)
           const fullCanvas = new Uint8Array(docW * docH * 4);
 
-          // Blit returned sourceBounds pixel block into its exact (left, top) offset inside fullCanvas
-          for (let y = 0; y < blockH; y++) {
-            const dstY = top + y;
-            if (dstY >= 0 && dstY < docH) {
-              const srcRow = y * blockW * 4;
-              const dstRow = (dstY * docW + left) * 4;
-              const copyBytes = Math.min(blockW, Math.max(0, docW - left)) * 4;
-              if (copyBytes > 0) {
-                fullCanvas.set(blockData.subarray(srcRow, srcRow + copyBytes), dstRow);
+          // Copy pixel data into fullCanvas at (left, top)
+          if (channels === 4) {
+            // Direct 4-channel RGBA copy with true un-matted alpha channel
+            for (let y = 0; y < blockH; y++) {
+              const dstY = top + y;
+              if (dstY >= 0 && dstY < docH) {
+                const srcRow = y * blockW * 4;
+                const dstRow = (dstY * docW + left) * 4;
+                const copyBytes = Math.min(blockW, Math.max(0, docW - left)) * 4;
+                if (copyBytes > 0) {
+                  fullCanvas.set(rawData.subarray(srcRow, srcRow + copyBytes), dstRow);
+                }
               }
+            }
+          } else if (channels === 3) {
+            // Opaque layer without alpha channel (e.g. locked Background): set A = 255
+            for (let y = 0; y < blockH; y++) {
+              const dstY = top + y;
+              if (dstY >= 0 && dstY < docH) {
+                for (let x = 0; x < blockW; x++) {
+                  const dstX = left + x;
+                  if (dstX >= 0 && dstX < docW) {
+                    const srcIdx = (y * blockW + x) * 3;
+                    const dstIdx = (dstY * docW + dstX) * 4;
+                    fullCanvas[dstIdx]     = rawData[srcIdx];
+                    fullCanvas[dstIdx + 1] = rawData[srcIdx + 1];
+                    fullCanvas[dstIdx + 2] = rawData[srcIdx + 2];
+                    fullCanvas[dstIdx + 3] = 255;
+                  }
+                }
+              }
+            }
+          }
+
+          // Dispose UXP native image memory
+          pixelObj.imageData.dispose();
+
+          // Check if layer has a user layer mask and modulate alpha channel
+          const maskKnownAbsent = layer.hasUserMask === false || layer.hasMask === false;
+          if (!maskKnownAbsent && typeof imaging.getLayerMask === "function") {
+            try {
+              const maskObj = await imaging.getLayerMask({
+                layerID: layer.id,
+                sourceBounds: { left: 0, top: 0, right: docW, bottom: docH },
+              });
+              if (maskObj && maskObj.imageData) {
+                const maskData = await maskObj.imageData.getData();
+                const maskW = maskObj.imageData.width;
+                const maskH = maskObj.imageData.height;
+                const maskComps = maskObj.imageData.components || 1;
+                const msb = maskObj.sourceBounds || maskObj.imageData.sourceBounds;
+                let mLeft = 0;
+                let mTop = 0;
+                if (msb) {
+                  mLeft = Math.round(Number(msb.left?._value ?? msb.left) || 0);
+                  mTop = Math.round(Number(msb.top?._value ?? msb.top) || 0);
+                }
+
+                for (let my = 0; my < maskH; my++) {
+                  const dstY = mTop + my;
+                  if (dstY >= 0 && dstY < docH) {
+                    for (let mx = 0; mx < maskW; mx++) {
+                      const dstX = mLeft + mx;
+                      if (dstX >= 0 && dstX < docW) {
+                        const maskVal = maskData[(my * maskW + mx) * maskComps] / 255;
+                        const dstIdx = (dstY * docW + dstX) * 4 + 3;
+                        fullCanvas[dstIdx] = Math.round(fullCanvas[dstIdx] * maskVal);
+                      }
+                    }
+                  }
+                }
+                maskObj.imageData.dispose();
+              }
+            } catch (maskErr) {
+              // Layer does not have a mask or mask reading failed
             }
           }
 
@@ -260,8 +309,6 @@ async function handle(rawMsg) {
             docWidth: docW,
             docHeight: docH,
           });
-
-          pixelObj.imageData.dispose();
         },
         { commandName: "Read Layer Pixels", interactive: false }
       );
