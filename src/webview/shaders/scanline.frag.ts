@@ -14,6 +14,7 @@ uniform sampler2D u_source;      // Original image texture
 uniform sampler2D u_depth;       // Depth Anything V2 depth texture
 uniform int u_hasDepth;          // 1 = depth map available, 0 = luma only
 uniform float u_depthCutoff;     // Drops background behind Z-plane [0..1]
+uniform vec2 u_resolution;       // Render buffer resolution (width, height)
 uniform float u_aspect;          // canvas width / height
 uniform int u_direction;         // 0 = vertical, 1 = horizontal, 2 = circles
 uniform float u_centerX;         // Concentric circles center X [0..1]
@@ -24,7 +25,8 @@ uniform float u_noiseScale;      // FBM spatial frequency
 uniform float u_noiseSeed;       // Noise seed
 uniform float u_density;         // Isolines density
 uniform float u_lineThickness;   // Line thickness factor
-uniform float u_pixelQuant;      // Pixelation quantization [0..1]
+uniform float u_pixel;           // Pixel slider [0..100]
+uniform float u_pixelQuant;      // Pixelation quantization [0..1] (compat)
 uniform float u_cutoff;          // Brightness cutoff threshold
 uniform float u_noise;           // Starry dust noise amount
 uniform float u_edgeAccent;      // Sobel gradient silhouette boost
@@ -85,14 +87,24 @@ void main() {
     discard;
   }
 
-  vec2 uv = v_uv;
-  if (u_pixelQuant > 0.0) {
-    float steps = mix(1024.0, 16.0, u_pixelQuant);
-    uv = (floor(uv * steps) + 0.5) / steps;
-  }
+  // Active render buffer resolution
+  vec2 res = (u_resolution.x > 0.0 && u_resolution.y > 0.0)
+    ? u_resolution
+    : vec2(max(1.0, u_aspect * 800.0), 800.0);
+
+  // Aspect-corrected 1:1 square grid quantization with smooth quadratic curve
+  float pixelVal = max(u_pixel, u_pixelQuant * 100.0);
+  float baseDim = min(res.x, res.y);
+  float t = clamp(pixelVal / 100.0, 0.0, 1.0);
+  float cellPx = mix(1.0, baseDim * 0.032, t * t);
+
+  vec2 cellSizeUV = vec2(cellPx) / res;
+  vec2 sampleUV = (pixelVal > 0.001)
+    ? clamp((floor(v_uv / cellSizeUV) + 0.5) * cellSizeUV, vec2(0.0), vec2(1.0))
+    : v_uv;
 
   // 1. Sample smoothed elevation field & raw components
-  vec4 elevSample = texture(u_elevation, uv);
+  vec4 elevSample = texture(u_elevation, sampleUV);
   float smoothE = elevSample.r;
   float sobelEdge = elevSample.g;
   float alpha = elevSample.b;
@@ -102,14 +114,14 @@ void main() {
   }
 
   // 2. High-pass detail boost
-  vec4 rawSample = texture(u_rawLuma, uv);
+  vec4 rawSample = texture(u_rawLuma, sampleUV);
   float rawE = rawSample.r;
   float highPass = rawE - smoothE;
   float E = clamp(smoothE + highPass * (u_detailBoost * 2.2), 0.0, 1.0);
 
   // 3. Depth Anything V2 Z-plane cutoff
   if (u_hasDepth == 1 && u_depthCutoff > 0.001) {
-    float depthVal = texture(u_depth, uv).r;
+    float depthVal = texture(u_depth, sampleUV).r;
     if (depthVal < u_depthCutoff) {
       discard;
     }
@@ -119,32 +131,43 @@ void main() {
   float basePhase = 0.0;
   if (u_direction == 0) {
     // Vertical mode
-    basePhase = uv.x * u_aspect;
+    basePhase = sampleUV.x * u_aspect;
   } else if (u_direction == 1) {
     // Horizontal mode
-    basePhase = uv.y;
+    basePhase = sampleUV.y;
   } else {
     // Concentric Circles mode
     vec2 center = vec2(u_centerX, u_centerY);
-    vec2 delta = (uv - center) * vec2(u_aspect, 1.0);
+    vec2 delta = (sampleUV - center) * vec2(u_aspect, 1.0);
     basePhase = length(delta);
   }
 
   // Displace phi using smoothed elevation E and elevation-modulated organic domain warp
-  vec2 noiseCoord = uv * u_noiseScale + vec2(u_noiseSeed * 0.173, u_noiseSeed * 0.317);
+  vec2 noiseCoord = sampleUV * u_noiseScale + vec2(u_noiseSeed * 0.173, u_noiseSeed * 0.317);
   float organicNoise = fbm(noiseCoord);
   float warp = E * u_displacement + E * organicNoise * u_organicWarp;
   float phase = (basePhase + warp) * u_density;
 
-  // 5. Razor-sharp, anti-aliased isolines from fwidth(phase)
-  float fw = max(0.0001, fwidth(phase));
-  float dist = abs(fract(phase) - 0.5) / fw;
-  float halfWidth = max(0.2, u_lineThickness * 0.55);
-  float lineAlpha = clamp(halfWidth - dist + 0.5, 0.0, 1.0);
+  // 5. Razor-sharp isoline evaluation: crisp binary step when pixelated, fwidth AA when smooth
+  float lineAlpha = 0.0;
+  if (pixelVal > 0.001) {
+    float distToLine = abs(fract(phase) - 0.5);
+    float cellPhaseStep = (cellPx / res.y) * u_density;
+    float nominalHalfWidth = cellPhaseStep * 0.52 * max(0.5, u_lineThickness);
+    // Enforce a minimum thickness equal to the cell's phase span (cellPhaseStep * 0.52)
+    // so every contour forms a solid, connected staircase of uniform square pixels without gaps.
+    float halfWidth = min(max(nominalHalfWidth, cellPhaseStep * 0.52), 0.48);
+    lineAlpha = step(distToLine, halfWidth);
+  } else {
+    float fw = max(0.0001, fwidth(phase));
+    float dist = abs(fract(phase) - 0.5) / fw;
+    float halfWidth = max(0.2, u_lineThickness * 0.55);
+    lineAlpha = clamp(halfWidth - dist + 0.5, 0.0, 1.0);
 
-  // Nyquist anti-flicker suppression
-  if (fw > 0.5) {
-    lineAlpha *= clamp(1.0 - (fw - 0.5) * 2.0, 0.0, 1.0);
+    // Nyquist anti-flicker suppression
+    if (fw > 0.5) {
+      lineAlpha *= clamp(1.0 - (fw - 0.5) * 2.0, 0.0, 1.0);
+    }
   }
 
   if (lineAlpha <= 0.001) {
@@ -154,17 +177,24 @@ void main() {
   // 6. Cutoff threshold: dissolve or cut dark valleys
   if (E < u_cutoff) {
     float cutoffRatio = E / max(u_cutoff, 0.0001);
-    float n = hash2(uv * 180.0, u_noiseSeed);
+    float n = hash2(sampleUV * 180.0, u_noiseSeed);
     float dissolveThresh = (1.0 - cutoffRatio) * (u_noise + 0.1);
     if (n < dissolveThresh * 0.8) {
       discard;
     }
-    lineAlpha *= cutoffRatio;
+    if (pixelVal > 0.001) {
+      if (cutoffRatio < 0.25) {
+        discard;
+      }
+    } else {
+      lineAlpha *= cutoffRatio;
+    }
   }
 
   // 7. Seeded 2D starry Dust Noise
   if (u_noise > 0.0) {
-    float nVal = hash2(uv * 320.0, u_noiseSeed + 7.71);
+    vec2 noiseUV = (pixelVal > 0.001) ? sampleUV : v_uv;
+    float nVal = hash2(noiseUV * 320.0, u_noiseSeed + 7.71);
     float mask = 1.0 - u_noise * (1.0 - E * 0.85);
     if (nVal > mask) {
       discard;
@@ -174,7 +204,7 @@ void main() {
   // 8. Color selection: Solid Tint (0) | Gradient Ramp (1) | Picture Colours (2)
   vec3 rgb;
   if (u_colorMode == 2) {
-    vec4 srcRaw = texture(u_source, uv);
+    vec4 srcRaw = texture(u_source, sampleUV);
     rgb = srcRaw.rgb * srcRaw.a;
   } else if (u_colorMode == 1) {
     rgb = mix(u_shadowColor, u_peakColor, E);
@@ -191,7 +221,8 @@ void main() {
   float ridgeBoost = smoothstep(0.35, 0.95, E);
   rgb = mix(rgb, rgb * 1.35 + vec3(0.04), ridgeBoost * 0.35);
 
-  float finalA = clamp(lineAlpha * alpha, 0.0, 1.0);
+  float cellAlpha = (pixelVal > 0.001) ? (alpha > 0.2 ? 1.0 : 0.0) : alpha;
+  float finalA = clamp(lineAlpha * cellAlpha, 0.0, 1.0);
   if (finalA <= 0.001) {
     discard;
   }

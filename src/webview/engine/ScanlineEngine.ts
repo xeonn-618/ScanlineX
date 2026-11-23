@@ -49,6 +49,15 @@ export class ScanlineEngine {
   private frameCount = 0;
   private initialized = false;
 
+  private previewPixels: Uint8Array | null = null;
+  private previewW = 0;
+  private previewH = 0;
+  private previewDepthBuffer: Uint8Array | null = null;
+  private previewDepthW = 0;
+  private previewDepthH = 0;
+  private lastViewMode: ViewportMode = "composite";
+  private lastSplitX = 0.5;
+
   constructor(canvas: HTMLCanvasElement) {
     const gl = canvas.getContext("webgl2", {
       alpha: true,
@@ -105,7 +114,12 @@ export class ScanlineEngine {
     this.bloom.resize(gl, this.width, this.height, IF, F, T);
   }
 
-  uploadSourceTexture(pixels: Uint8Array, w: number, h: number): void {
+  uploadSourceTexture(pixels: Uint8Array, w: number, h: number, isPreview = true): void {
+    if (isPreview) {
+      this.previewPixels = pixels;
+      this.previewW = w;
+      this.previewH = h;
+    }
     const gl = this.gl;
     if (!this.sourceTex) this.sourceTex = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
@@ -129,7 +143,12 @@ export class ScanlineEngine {
     this.maxLum = maxL > minL ? maxL : 1.0;
   }
 
-  uploadDepthTexture(depthBuffer: Uint8Array, w: number, h: number): void {
+  uploadDepthTexture(depthBuffer: Uint8Array, w: number, h: number, isPreview = true): void {
+    if (isPreview) {
+      this.previewDepthBuffer = depthBuffer;
+      this.previewDepthW = w;
+      this.previewDepthH = h;
+    }
     const gl = this.gl;
     if (!this.depthTex) this.depthTex = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, this.depthTex);
@@ -143,6 +162,7 @@ export class ScanlineEngine {
 
   clearDepthTexture(): void {
     this.hasDepthMap = false;
+    this.previewDepthBuffer = null;
   }
 
   hasDepth(): boolean {
@@ -167,8 +187,20 @@ export class ScanlineEngine {
     splitX = 0.5,
     exportTarget: OffscreenTarget = "composite"
   ): void {
-    if (!this.initialized || !this.sourceTex || this.width === 0 || this.height === 0) return;
     const gl = this.gl;
+    if (gl.isContextLost()) return;
+
+    if (exportTarget === "composite") {
+      this.lastViewMode = viewMode;
+      this.lastSplitX = splitX;
+    }
+
+    const canvas = gl.canvas as HTMLCanvasElement;
+    if (canvas.width > 0 && canvas.height > 0 && (this.width !== canvas.width || this.height !== canvas.height)) {
+      this.resize(canvas.width, canvas.height);
+    }
+
+    if (!this.initialized || !this.sourceTex || this.width === 0 || this.height === 0) return;
     this.frameCount++;
     const W = this.width;
     const H = this.height;
@@ -189,6 +221,7 @@ export class ScanlineEngine {
     gl.bindVertexArray(this.scanlineGridVAO);
 
     const sp = this.scanlineProg;
+    gl.uniform2f(gl.getUniformLocation(sp, "u_resolution"), W, H);
     gl.uniform1i(gl.getUniformLocation(sp, "u_elevation"), 0);
     gl.uniform1i(gl.getUniformLocation(sp, "u_rawLuma"), 1);
     gl.uniform1i(gl.getUniformLocation(sp, "u_source"), 2);
@@ -208,6 +241,7 @@ export class ScanlineEngine {
     gl.uniform1f(gl.getUniformLocation(sp, "u_noiseSeed"), params.noiseSeed);
     gl.uniform1f(gl.getUniformLocation(sp, "u_density"), params.density);
     gl.uniform1f(gl.getUniformLocation(sp, "u_lineThickness"), Math.max(0.2, params.lineThickness));
+    gl.uniform1f(gl.getUniformLocation(sp, "u_pixel"), params.pixel ?? 0);
     gl.uniform1f(gl.getUniformLocation(sp, "u_pixelQuant"), (params.pixel ?? 0) / 100);
     gl.uniform1f(gl.getUniformLocation(sp, "u_cutoff"), params.cutoff);
     gl.uniform1f(gl.getUniformLocation(sp, "u_noise"), params.noise);
@@ -293,12 +327,14 @@ export class ScanlineEngine {
     const savedCanvasW = canvas.width;
     const savedCanvasH = canvas.height;
 
+    // 1. Offscreen render target sizing & source upload
     canvas.width = srcW;
     canvas.height = srcH;
-    this.uploadSourceTexture(pixels, srcW, srcH);
+    this.uploadSourceTexture(pixels, srcW, srcH, false);
     this.resize(srcW, srcH);
     this.render(params, "composite", 0.5, target);
 
+    // 2. Read full-res render pixels
     const rawBuffer = new Uint8Array(srcW * srcH * 4);
     gl.readPixels(0, 0, srcW, srcH, gl.RGBA, gl.UNSIGNED_BYTE, rawBuffer);
 
@@ -310,9 +346,18 @@ export class ScanlineEngine {
       flippedBuffer.set(rawBuffer.subarray(srcOffset, srcOffset + rowBytes), dstOffset);
     }
 
+    // 3. Fully restore live preview canvas, textures, FBOs, and u_resolution
     canvas.width = savedCanvasW;
     canvas.height = savedCanvasH;
-    this.resize(savedW, savedH);
+    if (this.previewPixels) {
+      this.uploadSourceTexture(this.previewPixels, this.previewW, this.previewH, false);
+    }
+    if (this.previewDepthBuffer) {
+      this.uploadDepthTexture(this.previewDepthBuffer, this.previewDepthW, this.previewDepthH, false);
+    }
+    this.resize(savedCanvasW, savedCanvasH);
+    this.render(params, this.lastViewMode, this.lastSplitX, "composite");
+
     return flippedBuffer;
   }
 

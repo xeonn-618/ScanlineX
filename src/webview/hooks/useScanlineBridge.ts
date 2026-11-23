@@ -57,7 +57,7 @@ export function useScanlineBridge({
             fullDepth[y * docW + x] = prevDepth[sy * previewW + sx];
           }
         }
-        engineRef.current.uploadDepthTexture(fullDepth, docW, docH);
+        engineRef.current.uploadDepthTexture(fullDepth, docW, docH, false);
       }
 
       if (p.keepAs === "lines-glow") {
