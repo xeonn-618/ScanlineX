@@ -440,7 +440,9 @@ float tpdfGrain(vec2 p, float seed) {
 void main() {
   vec4 scanSample = texture(u_scanlines, v_uv);
   vec4 bloomSample = texture(u_bloom, v_uv);
-  vec4 srcSample = texture(u_source, v_uv);
+  // Invert Y when sampling u_source so raw image pixels (row 0 at top) match upright screen FBO orientation
+  vec2 srcUV = vec2(v_uv.x, 1.0 - v_uv.y);
+  vec4 srcSample = texture(u_source, srcUV);
 
   if (u_exportTarget == 1) {
     // Glow only layer

@@ -96,10 +96,14 @@ function sendToWebView(payload) {
   }
 }
 
-// ── 2. Deduplication Guard ───────────────────────────────────────────────────
+// ── 2. Deduplication Guard & In-Flight Mutex ─────────────────────────────────
 const processedMessageIds = new Set();
 let lastSignature = "";
 let lastTime = 0;
+
+let isFetchingLayerHost = false;
+let lastHostFetchCompletedTime = 0;
+const HOST_FETCH_COOLDOWN_MS = 1500;
 
 function isDuplicate(msg) {
   if (!msg || typeof msg !== "object") return true;
@@ -137,6 +141,19 @@ async function handle(rawMsg) {
 
   // ── REQUEST_ACTIVE_LAYER ──────────────────────────────────────────────────
   if (msg.type === "REQUEST_ACTIVE_LAYER") {
+    const now = Date.now();
+    if (isFetchingLayerHost) {
+      console.warn("[Host] REQUEST_ACTIVE_LAYER dropped: layer fetch already in-flight");
+      return;
+    }
+    if (msg.purpose !== "COMMIT" && now - lastHostFetchCompletedTime < HOST_FETCH_COOLDOWN_MS) {
+      console.warn(
+        `[Host] REQUEST_ACTIVE_LAYER dropped: cooldown active (${HOST_FETCH_COOLDOWN_MS - (now - lastHostFetchCompletedTime)}ms remaining)`
+      );
+      return;
+    }
+
+    isFetchingLayerHost = true;
     try {
       const doc = app.activeDocument;
       if (!doc) throw new Error("No active document found in Photoshop.");
@@ -202,7 +219,7 @@ async function handle(rawMsg) {
 
           pixelObj.imageData.dispose();
         },
-        { commandName: "Read Layer Pixels" }
+        { commandName: "Read Layer Pixels", interactive: false }
       );
     } catch (err) {
       console.error("[Host] REQUEST_ACTIVE_LAYER error:", err);
@@ -210,6 +227,9 @@ async function handle(rawMsg) {
         type: "ERROR",
         message: err ? (err.message || String(err)) : "Failed to read layer pixels",
       });
+    } finally {
+      isFetchingLayerHost = false;
+      lastHostFetchCompletedTime = Date.now();
     }
   }
 

@@ -200,6 +200,10 @@ export const App: React.FC = () => {
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const paramsRef = useRef(params);
   paramsRef.current = params;
+  const viewModeRef = useRef(viewMode);
+  viewModeRef.current = viewMode;
+  const splitXRef = useRef(splitX);
+  splitXRef.current = splitX;
 
   const updateParam = useCallback(<K extends keyof ScanlineParams>(key: K, val: ScanlineParams[K]) => {
     setParams((prev) => {
@@ -226,7 +230,7 @@ export const App: React.FC = () => {
       const fallbackPixels = createFallbackImage(fallbackW, fallbackH);
       renderer.uploadSourceTexture(fallbackPixels, fallbackW, fallbackH);
       renderer.resize(fallbackW, fallbackH);
-      renderer.render(paramsRef.current, viewMode, splitX);
+      renderer.render(paramsRef.current, viewModeRef.current, splitXRef.current);
     } catch (err) {
       console.error("[ScanlineX] WebGL init error:", err);
       setStatus("error");
@@ -239,13 +243,13 @@ export const App: React.FC = () => {
     };
   }, []);
 
-  // Re-render when parameters or viewport mode change
+  // Re-render when parameters or viewport mode change (PURE GPU UNIFORM UPDATE, NEVER FETCHES LAYER)
   useEffect(() => {
     if (!rendererRef.current) return;
     rendererRef.current.render(params, viewMode, splitX);
   }, [params, viewMode, splitX]);
 
-  // ── 2. UXP IPC Message Bridge ──────────────────────────────────────────────
+  // ── 2. UXP IPC Message Bridge (MOUNT ONLY: Never re-subscribes on viewMode/splitX) ──
   useEffect(() => {
     const unsubscribe = onUxpMessage((msg) => {
       if (msg.type === "LAYER_PIXELS") {
@@ -268,7 +272,7 @@ export const App: React.FC = () => {
           canvasRef.current.height = msg.height;
           rendererRef.current.uploadSourceTexture(msg.buffer, msg.width, msg.height);
           rendererRef.current.resize(msg.width, msg.height);
-          rendererRef.current.render(paramsRef.current, viewMode, splitX);
+          rendererRef.current.render(paramsRef.current, viewModeRef.current, splitXRef.current);
         }
 
         setStatus("ready");
@@ -285,10 +289,11 @@ export const App: React.FC = () => {
       }
     });
 
+    // Request active layer preview strictly once on initial mount
     sendToUxp({ type: "REQUEST_ACTIVE_LAYER", maxPreviewDim: 800, purpose: "PREVIEW" });
 
     return () => unsubscribe();
-  }, [viewMode, splitX]);
+  }, []);
 
   // ── 3. Depth Anything V2 Generation ────────────────────────────────────────
   const handleGenerateDepth = async () => {

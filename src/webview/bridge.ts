@@ -89,8 +89,39 @@ export function base64ToUint8(base64: string): Uint8Array {
 
 let msgCounter = 0;
 
+// Strict in-flight mutex & cooldown guard
+let isFetchingLayer = false;
+let lastFetchCompletedTime = 0;
+const FETCH_COOLDOWN_MS = 1500;
+
+export function canRequestActiveLayer(purpose?: string): boolean {
+  if (purpose === "COMMIT") {
+    return true; // Always allow commit requests to proceed
+  }
+  if (isFetchingLayer) {
+    console.warn("[Bridge] REQUEST_ACTIVE_LAYER dropped: layer fetch already in-flight");
+    return false;
+  }
+  const now = Date.now();
+  const elapsed = now - lastFetchCompletedTime;
+  if (elapsed < FETCH_COOLDOWN_MS) {
+    console.warn(
+      `[Bridge] REQUEST_ACTIVE_LAYER dropped: cooldown active (${FETCH_COOLDOWN_MS - elapsed}ms remaining)`
+    );
+    return false;
+  }
+  return true;
+}
+
 export function sendToUxp(message: WebViewToUxpMessage): void {
   if (window.uxpHost) {
+    if (message.type === "REQUEST_ACTIVE_LAYER") {
+      if (!canRequestActiveLayer(message.purpose)) {
+        return;
+      }
+      isFetchingLayer = true;
+    }
+
     const _msgId = `${Date.now()}_${++msgCounter}_${Math.random().toString(36).slice(2, 7)}`;
 
     if (message.type === "COMMIT_LAYER") {
@@ -132,6 +163,9 @@ export function onUxpMessage(handler: (message: UxpToWebViewMessage) => void): (
       const msg = payload as Record<string, unknown>;
 
       if (msg.type === "LAYER_PIXELS") {
+        isFetchingLayer = false;
+        lastFetchCompletedTime = Date.now();
+
         let uint8: Uint8Array;
         if (typeof msg.base64 === "string") {
           uint8 = base64ToUint8(msg.base64);
@@ -160,6 +194,11 @@ export function onUxpMessage(handler: (message: UxpToWebViewMessage) => void): (
           docHeight: msg.docHeight ? Number(msg.docHeight) : undefined,
         });
         return;
+      }
+
+      if (msg.type === "ERROR") {
+        isFetchingLayer = false;
+        lastFetchCompletedTime = Date.now();
       }
 
       handler(payload as UxpToWebViewMessage);
