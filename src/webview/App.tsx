@@ -259,6 +259,21 @@ export const App: React.FC = () => {
         }
 
         // Preview mode
+        // Auto-detect transparency for cutout / masked layers
+        let hasCutoutAlpha = false;
+        const buf = msg.buffer;
+        const len = buf.length;
+        const stride = Math.max(4, Math.floor(len / 2000) * 4);
+        for (let i = 3; i < len; i += stride) {
+          if (buf[i] < 240) {
+            hasCutoutAlpha = true;
+            break;
+          }
+        }
+        if (hasCutoutAlpha) {
+          setParams((prev) => (prev.transparent ? prev : { ...prev, transparent: true }));
+        }
+
         setActiveLayer({
           width: msg.width,
           height: msg.height,

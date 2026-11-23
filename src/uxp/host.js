@@ -165,33 +165,24 @@ async function handle(rawMsg) {
 
       await core.executeAsModal(
         async () => {
-          const sourceBounds = { left: 0, top: 0, right: docW, bottom: docH };
-
           const opts = {
             layerID: layer.id,
             componentSize: 8,
             colorSpace: "RGB",
             applyAlpha: true,
-            sourceBounds: sourceBounds,
+            sourceBounds: { left: 0, top: 0, right: docW, bottom: docH },
           };
-
-          if (msg.maxPreviewDim) {
-            const scale = Math.min(1, msg.maxPreviewDim / Math.max(docW, docH));
-            opts.targetSize = {
-              width: Math.max(1, Math.round(docW * scale)),
-              height: Math.max(1, Math.round(docH * scale)),
-            };
-          }
 
           const pixelObj = await imaging.getPixels(opts);
           const rawData = await pixelObj.imageData.getData();
           let channels = pixelObj.imageData.components;
-          const width = pixelObj.imageData.width;
-          const height = pixelObj.imageData.height;
+          const blockW = pixelObj.imageData.width;
+          const blockH = pixelObj.imageData.height;
 
-          let pixelData = rawData;
+          // Normalize to 4 channels RGBA
+          let blockData = rawData;
           if (channels === 3) {
-            const pixelCount = width * height;
+            const pixelCount = blockW * blockH;
             const rgba = new Uint8Array(pixelCount * 4);
             for (let i = 0, j = 0; i < pixelCount; i++, j += 3) {
               const dest = i * 4;
@@ -200,17 +191,70 @@ async function handle(rawMsg) {
               rgba[dest + 2] = rawData[j + 2];
               rgba[dest + 3] = 255;
             }
-            pixelData = rgba;
+            blockData = rgba;
             channels = 4;
           }
 
-          const base64 = uint8ToBase64(pixelData);
+          // Extract bounding box offset inside document
+          const sb = pixelObj.sourceBounds || pixelObj.imageData.sourceBounds || layer.bounds;
+          let left = 0;
+          let top = 0;
+          if (sb) {
+            left = Math.round(Number(sb.left?._value ?? sb.left) || 0);
+            top = Math.round(Number(sb.top?._value ?? sb.top) || 0);
+          }
+
+          // Allocate full-document buffer initialized to all zeros (0, 0, 0, 0)
+          const fullCanvas = new Uint8Array(docW * docH * 4);
+
+          // Blit returned sourceBounds pixel block into its exact (left, top) offset inside fullCanvas
+          for (let y = 0; y < blockH; y++) {
+            const dstY = top + y;
+            if (dstY >= 0 && dstY < docH) {
+              const srcRow = y * blockW * 4;
+              const dstRow = (dstY * docW + left) * 4;
+              const copyBytes = Math.min(blockW, Math.max(0, docW - left)) * 4;
+              if (copyBytes > 0) {
+                fullCanvas.set(blockData.subarray(srcRow, srcRow + copyBytes), dstRow);
+              }
+            }
+          }
+
+          // Downsample fullCanvas for fast preview if requested
+          let outPixels = fullCanvas;
+          let outW = docW;
+          let outH = docH;
+
+          if (msg.maxPreviewDim && Math.max(docW, docH) > msg.maxPreviewDim) {
+            const scale = msg.maxPreviewDim / Math.max(docW, docH);
+            outW = Math.max(1, Math.round(docW * scale));
+            outH = Math.max(1, Math.round(docH * scale));
+            outPixels = new Uint8Array(outW * outH * 4);
+            const stepX = docW / outW;
+            const stepY = docH / outH;
+            for (let py = 0; py < outH; py++) {
+              const sy = Math.min(docH - 1, Math.floor(py * stepY));
+              const sRow = sy * docW * 4;
+              const dRow = py * outW * 4;
+              for (let px = 0; px < outW; px++) {
+                const sx = Math.min(docW - 1, Math.floor(px * stepX));
+                const sIdx = sRow + sx * 4;
+                const dIdx = dRow + px * 4;
+                outPixels[dIdx]     = fullCanvas[sIdx];
+                outPixels[dIdx + 1] = fullCanvas[sIdx + 1];
+                outPixels[dIdx + 2] = fullCanvas[sIdx + 2];
+                outPixels[dIdx + 3] = fullCanvas[sIdx + 3];
+              }
+            }
+          }
+
+          const base64 = uint8ToBase64(outPixels);
 
           sendToWebView({
             type: "LAYER_PIXELS",
-            width,
-            height,
-            channels,
+            width: outW,
+            height: outH,
+            channels: 4,
             base64,
             purpose: msg.purpose || (msg.maxPreviewDim ? "PREVIEW" : "COMMIT"),
             docWidth: docW,

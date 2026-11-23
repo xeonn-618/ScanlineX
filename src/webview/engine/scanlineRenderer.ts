@@ -46,9 +46,13 @@ out vec4 fragColor;
 
 float getConditionedLuma(vec2 uv) {
   vec4 s = texture(u_source, uv);
-  // Strictly respect Photoshop layer alpha / active layer mask
-  s.rgb *= s.a;
-  float luma = dot(s.rgb, vec3(0.2126, 0.7152, 0.0722)) * s.a;
+  float a = s.a;
+
+  // Immediately premultiply RGB by alpha: cutout transparent pixels with RGB (255,255,255,0) become strictly 0
+  vec3 rgb = s.rgb * a;
+
+  // Compute luminance strictly from premultiplied RGB * alpha BEFORE applying Auto-Normalize or Input Levels
+  float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722)) * a;
 
   // Auto-Normalize histogram if enabled
   if (u_autoNorm == 1) {
@@ -61,7 +65,7 @@ float getConditionedLuma(vec2 uv) {
 
   // Gamma correction
   luma = pow(luma, 1.0 / max(0.01, u_gamma));
-  return luma;
+  return luma * a;
 }
 
 void main() {
@@ -85,7 +89,7 @@ void main() {
   float srcAlpha = texture(u_source, v_uv).a;
 
   // Channel R: conditioned luminance, Channel G: Sobel edge accent, Channel B: alpha
-  fragColor = vec4(c, sobelEdge, srcAlpha, 1.0);
+  fragColor = vec4(c, sobelEdge * srcAlpha, srcAlpha, 1.0);
 }`;
 
 // Pass 0B: Separable Gaussian Pre-Blur (Horizontal)
@@ -160,6 +164,7 @@ out float v_edge;
 out float v_side;
 out float v_lineT;
 out float v_depthCut;
+out float v_alpha;
 
 void main() {
   float n = u_density;
@@ -179,18 +184,25 @@ void main() {
     sampleUV = vec2(progress, tSample);
   }
 
-  // Sample conditioned luminance (R) and Sobel edge (G)
+  // Sample conditioned luminance (R), Sobel edge (G), blurred alpha (B)
   vec4 lumaSample = texture(u_luma, sampleUV);
   float lum = lumaSample.r;
   float edge = lumaSample.g;
+  float sampledAlpha = lumaSample.b;
+
+  // Polarity invert strictly masked by sampled alpha so transparent areas never invert to 1.0
   if (u_invert == 1) {
-    lum = 1.0 - lum;
+    lum = (1.0 - lum) * sampledAlpha;
   }
 
-  // Sample Depth Anything V2 map if loaded
+  // Sample Depth Anything V2 map if loaded, or drop transparent pixels
   float depthVal = lum;
   float isCut = 0.0;
-  if (u_hasDepth == 1) {
+  if (sampledAlpha < 0.02) {
+    isCut = 1.0;
+    lum = 0.0;
+    depthVal = 0.0;
+  } else if (u_hasDepth == 1) {
     depthVal = texture(u_depth, sampleUV).r;
     if (u_depthCutoff > 0.001) {
       if (depthVal < u_depthCutoff) {
@@ -206,6 +218,7 @@ void main() {
 
   // Boost relief with Sobel silhouette edge accent
   reliefVal += edge * u_edgeAccent * 0.35;
+  reliefVal *= sampledAlpha;
 
   // Rutt-Etra 3D relief displacement
   float disp = reliefVal * u_displacement * 0.45;
@@ -252,6 +265,7 @@ void main() {
   v_side = a_side;
   v_lineT = a_t;
   v_depthCut = isCut;
+  v_alpha = sampledAlpha;
 
   gl_Position = projPos;
 }`;
@@ -278,6 +292,7 @@ in float v_edge;
 in float v_side;
 in float v_lineT;
 in float v_depthCut;
+in float v_alpha;
 
 out vec4 fragColor;
 
@@ -288,8 +303,14 @@ float hash2(vec2 p, float s) {
 }
 
 void main() {
-  // If behind Z-plane depth cutoff, completely drop pixel
-  if (v_depthCut > 0.5) {
+  // If behind Z-plane depth cutoff or transparent background, completely drop pixel
+  if (v_depthCut > 0.5 || v_alpha < 0.01) {
+    discard;
+  }
+
+  // Smooth mask along subject cutout boundary
+  float subjectMask = smoothstep(0.02, 0.15, v_alpha);
+  if (subjectMask <= 0.001) {
     discard;
   }
 
@@ -327,7 +348,8 @@ void main() {
   // Color selection: Solid Tint (0) | Gradient Ramp (1) | Picture Colours (2)
   vec3 rgb;
   if (u_colorMode == 2) {
-    rgb = texture(u_source, uv).rgb;
+    vec4 srcRaw = texture(u_source, uv);
+    rgb = srcRaw.rgb * srcRaw.a;
   } else if (u_colorMode == 1) {
     // Gradient Ramp between Shadow and Peak colors based on elevation relief
     rgb = mix(u_shadowColor, u_peakColor, v_relief);
@@ -345,8 +367,11 @@ void main() {
   float ridgeBoost = smoothstep(0.35, 0.95, lum);
   rgb = mix(rgb, rgb * 1.5 + vec3(0.04), ridgeBoost * 0.35);
 
-  float alpha = clamp(lum * edgeAA, 0.0, 1.0);
-  fragColor = vec4(rgb * edgeAA, alpha);
+  float alpha = clamp(lum * edgeAA, 0.0, 1.0) * subjectMask;
+  if (alpha <= 0.001) {
+    discard;
+  }
+  fragColor = vec4(rgb * edgeAA * subjectMask, alpha);
 }`;
 
 // Pass 2: Dual-Kawase Downsample
@@ -461,9 +486,9 @@ void main() {
   vec3 fx = lineRGB + bloomRGB;
   float alpha = clamp(scanSample.a + bloomSample.a * u_glow * 0.7, 0.0, 1.0);
 
-  if (u_grain > 0.0) {
+  if (u_grain > 0.0 && alpha > 0.001) {
     float g = tpdfGrain(gl_FragCoord.xy, u_time);
-    fx += g * u_grain * 0.14;
+    fx += g * u_grain * 0.14 * alpha;
     fx = clamp(fx, 0.0, 1.0);
   }
 
@@ -494,7 +519,11 @@ void main() {
       fragColor = vec4(0.95, 0.95, 0.96, 1.0);
       return;
     } else if (v_uv.x < u_splitX) {
-      fragColor = srcSample;
+      if (u_transparent == 1) {
+        fragColor = vec4(srcSample.rgb * srcSample.a, srcSample.a);
+      } else {
+        fragColor = vec4(mix(u_bgColor, srcSample.rgb, srcSample.a), 1.0);
+      }
       return;
     }
   }
